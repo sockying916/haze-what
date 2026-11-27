@@ -1,5 +1,6 @@
-import { X } from 'lucide-react';
+import { Activity, X } from 'lucide-react';
 import { useState } from 'react';
+import { type ApiHealthResult, checkApiHealth } from '../services/psiAdapter';
 
 interface ApiConnectionModalProps {
   isOpen: boolean;
@@ -9,8 +10,7 @@ interface ApiConnectionModalProps {
   onDisconnectToSimulation: () => void;
 }
 
-const DEFAULT_NEA_PSI_URL = 'https://api-open.data.gov.sg/v2/real-time/api/psi';
-const DEFAULT_NEA_PM25_URL = 'https://api-open.data.gov.sg/v2/real-time/api/pm25';
+const DEFAULT_SERVERLESS_PSI_URL = '/api/psi';
 
 export function ApiConnectionModal({
   isOpen,
@@ -19,12 +19,29 @@ export function ApiConnectionModal({
   onConnectLiveApi,
   onDisconnectToSimulation,
 }: ApiConnectionModalProps) {
-  const [psiUrl, setPsiUrl] = useState(DEFAULT_NEA_PSI_URL);
-  const [pm25Url, setPm25Url] = useState(DEFAULT_NEA_PM25_URL);
+  const [psiUrl, setPsiUrl] = useState(DEFAULT_SERVERLESS_PSI_URL);
+  const [pm25Url, setPm25Url] = useState('');
   const [isTesting, setIsTesting] = useState(false);
+  const [isCheckingHealth, setIsCheckingHealth] = useState(false);
+  const [healthResult, setHealthResult] = useState<ApiHealthResult | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   if (!isOpen) return null;
+
+  const handleHealthCheck = async () => {
+    setErrorMsg(null);
+    setIsCheckingHealth(true);
+    try {
+      const result = await checkApiHealth(true);
+      setHealthResult(result);
+    } catch (err) {
+      setErrorMsg(
+        err instanceof Error ? err.message : 'Unable to reach /api/health.'
+      );
+    } finally {
+      setIsCheckingHealth(false);
+    }
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -37,7 +54,7 @@ export function ApiConnectionModal({
       setErrorMsg(
         err instanceof Error
           ? err.message
-          : 'Unable to reach endpoint. Check CORS or endpoint response schema.'
+          : 'Unable to reach endpoint. Check /api/health or upstream availability.'
       );
     } finally {
       setIsTesting(false);
@@ -58,10 +75,11 @@ export function ApiConnectionModal({
               id="api-modal-title"
               className="font-display text-base font-semibold text-slate-900"
             >
-              Connect Live Singapore PSI Endpoint
+              Serverless Data.gov.sg Connection
             </h2>
             <p className="text-xs text-slate-500 mt-0.5">
-              Frontend adapter is pre-mapped to Data.gov.sg / NEA v2 real-time JSON
+              Proxied via <code className="font-mono">/api/psi</code> to{' '}
+              <code className="font-mono">api-open.data.gov.sg</code>
             </p>
           </div>
           <button
@@ -80,14 +98,15 @@ export function ApiConnectionModal({
               htmlFor="psi-endpoint-input"
               className="block text-xs font-semibold text-slate-700 mb-1"
             >
-              24-hr PSI Endpoint URL
+              PSI Endpoint URL
             </label>
             <input
               id="psi-endpoint-input"
-              type="url"
+              type="text"
               required
               value={psiUrl}
               onChange={(e) => setPsiUrl(e.target.value)}
+              placeholder="/api/psi"
               className="w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 font-mono text-xs text-slate-900 focus:border-sky-500 focus:bg-white focus:outline-none"
             />
           </div>
@@ -97,25 +116,49 @@ export function ApiConnectionModal({
               htmlFor="pm25-endpoint-input"
               className="block text-xs font-semibold text-slate-700 mb-1"
             >
-              1-hr PM2.5 Endpoint URL (Optional)
+              Optional Custom 1-hr PM2.5 URL (already merged by /api/psi)
             </label>
             <input
               id="pm25-endpoint-input"
-              type="url"
+              type="text"
               value={pm25Url}
               onChange={(e) => setPm25Url(e.target.value)}
+              placeholder="Leave blank when using /api/psi"
               className="w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 font-mono text-xs text-slate-900 focus:border-sky-500 focus:bg-white focus:outline-none"
             />
           </div>
 
-          <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs text-slate-600 space-y-1">
-            <div className="font-semibold text-slate-800">
-              Expected Adapter Path: <code className="font-mono">src/services/psiAdapter.ts</code>
+          <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs text-slate-600 space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <span className="font-semibold text-slate-800">
+                Serverless Functions: <code className="font-mono">/api/psi.ts</code> &amp;{' '}
+                <code className="font-mono">/api/health.ts</code>
+              </span>
+              <button
+                type="button"
+                onClick={handleHealthCheck}
+                disabled={isCheckingHealth}
+                className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-60 cursor-pointer"
+              >
+                <Activity className="h-3 w-3" aria-hidden="true" />
+                <span>{isCheckingHealth ? 'Checking...' : 'Check /api/health'}</span>
+              </button>
             </div>
-            <p>
-              Reads <code className="font-mono">data.items[0].readings.psi_twenty_four_hourly</code>{' '}
-              across <code className="font-mono">north, south, east, west, central, national</code>.
-            </p>
+
+            {healthResult && (
+              <div className="border-t border-slate-200 pt-2 font-mono text-[11px] text-slate-700 tabular-nums">
+                Status: <strong>{healthResult.status}</strong>
+                {healthResult.upstream && (
+                  <>
+                    {' '}
+                    · Upstream:{' '}
+                    {healthResult.upstream.reachable
+                      ? `Reachable (${healthResult.upstream.latencyMs} ms)`
+                      : healthResult.upstream.error || 'Unreachable'}
+                  </>
+                )}
+              </div>
+            )}
           </div>
 
           {errorMsg && (
@@ -137,11 +180,11 @@ export function ApiConnectionModal({
                 }}
                 className="rounded-lg border border-slate-200 px-3.5 py-2 text-xs font-medium text-slate-700 hover:bg-slate-100 cursor-pointer"
               >
-                Revert to Simulation
+                Switch to Simulation
               </button>
             ) : (
               <span className="text-xs text-slate-400">
-                Currently using local frontend simulation
+                Currently using simulation preset
               </span>
             )}
 
@@ -158,7 +201,7 @@ export function ApiConnectionModal({
                 disabled={isTesting}
                 className="rounded-lg bg-slate-900 px-4 py-2 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-60 cursor-pointer"
               >
-                {isTesting ? 'Connecting...' : 'Fetch Live Endpoint'}
+                {isTesting ? 'Connecting...' : 'Fetch Live PSI'}
               </button>
             </div>
           </div>

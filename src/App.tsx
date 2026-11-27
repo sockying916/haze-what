@@ -10,6 +10,7 @@ import { TopBar } from './components/TopBar';
 import {
   exportSnapshotCsv,
   fetchFromNeaCompatibleEndpoint,
+  fetchLivePsiFromServerless,
   generateSnapshot,
   getPm25BandLabel,
   getPsiBand,
@@ -26,7 +27,7 @@ import type {
 const SCENARIO_KEYS: ScenarioPreset[] = ['baseline', 'moderate', 'unhealthy', 'severe'];
 
 export default function App() {
-  const [scenario, setScenario] = useState<ScenarioPreset>('moderate');
+  const [scenario, setScenario] = useState<ScenarioPreset>('baseline');
   const [pollTick, setPollTick] = useState<number>(0);
   const [selectedRegion, setSelectedRegion] = useState<RegionId>('national');
   const [metricMode, setMetricMode] = useState<MapMetricMode>('psi24h');
@@ -36,7 +37,8 @@ export default function App() {
   const [liveEndpoints, setLiveEndpoints] = useState<{
     psiUrl: string;
     pm25Url?: string;
-  } | null>(null);
+  } | null>({ psiUrl: '/api/psi' });
+  const [apiNotice, setApiNotice] = useState<string | null>(null);
   const [isApiModalOpen, setIsApiModalOpen] = useState<boolean>(false);
   const [lastUpdatedTime, setLastUpdatedTime] = useState<Date>(() => new Date());
 
@@ -45,8 +47,35 @@ export default function App() {
     return generateSnapshot(scenario, lastUpdatedTime, pollTick);
   }, [liveSnapshot, scenario, lastUpdatedTime, pollTick]);
 
+  const loadLiveServerless = useCallback(async () => {
+    setIsRefreshing(true);
+    setApiNotice(null);
+    try {
+      const nextLive = await fetchLivePsiFromServerless();
+      setLiveSnapshot(nextLive);
+      setLiveEndpoints({ psiUrl: '/api/psi' });
+    } catch (err) {
+      setLiveSnapshot(null);
+      setLiveEndpoints(null);
+      setLastUpdatedTime(new Date());
+      setApiNotice(
+        err instanceof Error
+          ? `Live feed unavailable (${err.message}); showing simulation fallback.`
+          : 'Live feed unavailable; showing simulation fallback.'
+      );
+    } finally {
+      setIsRefreshing(false);
+    }
+  }, []);
+
+  // Automatically fetch live Singapore PSI via /api/psi on initial load
+  useEffect(() => {
+    void loadLiveServerless();
+  }, [loadLiveServerless]);
+
   const handleRefresh = useCallback(async () => {
     setIsRefreshing(true);
+    setApiNotice(null);
     try {
       if (liveEndpoints) {
         const nextLive = await fetchFromNeaCompatibleEndpoint(
@@ -59,10 +88,16 @@ export default function App() {
         setLastUpdatedTime(new Date());
         setPollTick((prev) => prev + 1);
       }
-    } catch {
-      // Fall back to simulated tick if live endpoint temporarily fails
+    } catch (err) {
       setLastUpdatedTime(new Date());
       setPollTick((prev) => prev + 1);
+      if (liveEndpoints) {
+        setApiNotice(
+          err instanceof Error
+            ? `Refresh error (${err.message}); retaining fallback readings.`
+            : 'Refresh error; retaining fallback readings.'
+        );
+      }
     } finally {
       setIsRefreshing(false);
     }
@@ -77,6 +112,7 @@ export default function App() {
   }, [autoPoll, handleRefresh]);
 
   const handleSelectScenario = (nextScenario: ScenarioPreset) => {
+    setApiNotice(null);
     setLiveSnapshot(null);
     setLiveEndpoints(null);
     setScenario(nextScenario);
@@ -88,11 +124,13 @@ export default function App() {
       psiUrl,
       pm25Url || undefined
     );
+    setApiNotice(null);
     setLiveSnapshot(nextLive);
     setLiveEndpoints({ psiUrl, pm25Url: pm25Url || undefined });
   };
 
   const handleDisconnectToSimulation = () => {
+    setApiNotice(null);
     setLiveSnapshot(null);
     setLiveEndpoints(null);
     setLastUpdatedTime(new Date());
@@ -144,15 +182,29 @@ export default function App() {
                 <span className="font-mono tabular-nums">{snapshot.wind.speedKmh} km/h</span>
               </span>
             </div>
+            {apiNotice && (
+              <p className="text-xs text-amber-700">{apiNotice}</p>
+            )}
           </div>
 
-          {/* Workspace Toolbar: Scenario Presets + Auto-Poll + API + Export */}
+          {/* Workspace Toolbar: Live + Scenario Presets + Auto-Poll + API + Export */}
           <div className="flex flex-wrap items-center gap-2">
             <div
               role="group"
-              aria-label="Haze condition scenario presets"
-              className="inline-flex items-center rounded-lg border border-slate-200 bg-white p-0.5"
+              aria-label="Data source and haze condition presets"
+              className="inline-flex flex-wrap items-center rounded-lg border border-slate-200 bg-white p-0.5"
             >
+              <button
+                type="button"
+                onClick={() => void loadLiveServerless()}
+                className={`rounded-md px-3 py-1.5 text-xs font-medium whitespace-nowrap shrink-0 transition-colors duration-150 cursor-pointer ${
+                  snapshot.isLiveApi
+                    ? 'bg-emerald-700 text-white'
+                    : 'text-slate-600 hover:text-slate-950'
+                }`}
+              >
+                Live (data.gov.sg)
+              </button>
               {SCENARIO_KEYS.map((key) => {
                 const active = !snapshot.isLiveApi && scenario === key;
                 return (
@@ -191,7 +243,7 @@ export default function App() {
               className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 whitespace-nowrap shrink-0 hover:bg-slate-100 transition-colors duration-150 cursor-pointer"
             >
               <Link2 className="h-3.5 w-3.5 text-slate-500" aria-hidden="true" />
-              <span>{snapshot.isLiveApi ? 'API Connected' : 'Connect API'}</span>
+              <span>{snapshot.isLiveApi ? 'API Status' : 'Connect API'}</span>
             </button>
 
             <button
@@ -337,10 +389,11 @@ export default function App() {
       <footer className="border-t border-slate-200 bg-white mt-8">
         <div className="mx-auto flex max-w-[1380px] flex-wrap items-center justify-between gap-4 px-6 py-4 text-xs text-slate-500">
           <span>
-            SG HazeWatch · Built for Singapore 5-region NEA PSI &amp; PM2.5 telemetry
+            SG HazeWatch · Singapore 5-region NEA PSI &amp; PM2.5 telemetry
           </span>
           <span>
-            Data adapter ready at <code className="font-mono text-slate-700">src/services/psiAdapter.ts</code>
+            Serverless routes: <code className="font-mono text-slate-700">/api/psi</code> &amp;{' '}
+            <code className="font-mono text-slate-700">/api/health</code>
           </span>
         </div>
       </footer>

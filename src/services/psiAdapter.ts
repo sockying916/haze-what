@@ -473,33 +473,98 @@ export function generateSnapshot(
   };
 }
 
+export interface ApiHealthResult {
+  status: string;
+  service: string;
+  timestamp: string;
+  upstream?: {
+    url: string;
+    reachable: boolean;
+    httpStatus?: number;
+    latencyMs?: number;
+    error?: string;
+  };
+}
+
+export async function checkApiHealth(checkUpstream = true): Promise<ApiHealthResult> {
+  const res = await fetch(`/api/health?checkUpstream=${checkUpstream ? 'true' : 'false'}`, {
+    headers: { Accept: 'application/json' },
+  });
+  const json = (await res.json()) as ApiHealthResult;
+  if (!res.ok && !json.status) {
+    throw new Error(`Health endpoint returned HTTP ${res.status}`);
+  }
+  return json;
+}
+
+function isAllowedEndpointUrl(rawUrl: string): boolean {
+  if (rawUrl.startsWith('/api/')) return true;
+  try {
+    const parsed = new URL(rawUrl);
+    return parsed.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
 /**
- * Adapter ready for Singapore NEA / Data.gov.sg v2 real-time PSI API:
- * Expected endpoint: https://api-open.data.gov.sg/v2/real-time/api/psi
- * Parses `data.items[0].readings` into the normalized PsiSnapshot contract.
+ * Fetches live Singapore PSI data via our root serverless function (/api/psi)
+ * backed by https://api-open.data.gov.sg/v2/real-time/api/psi
+ */
+export async function fetchLivePsiFromServerless(): Promise<PsiSnapshot> {
+  return fetchFromNeaCompatibleEndpoint('/api/psi');
+}
+
+/**
+ * Adapter for our serverless /api/psi endpoint or a direct NEA / Data.gov.sg v2 real-time PSI URL.
+ * Parses `data.items` into the normalized PsiSnapshot contract.
  */
 export async function fetchFromNeaCompatibleEndpoint(
   psiEndpointUrl: string,
   pm25EndpointUrl?: string
 ): Promise<PsiSnapshot> {
+  if (!isAllowedEndpointUrl(psiEndpointUrl)) {
+    throw new Error('Endpoint URL must be a relative /api/ path or an HTTPS URL.');
+  }
+
   const response = await fetch(psiEndpointUrl, {
     headers: { Accept: 'application/json' },
   });
 
   if (!response.ok) {
-    throw new Error(`Endpoint returned HTTP ${response.status}`);
+    let detail = `HTTP ${response.status}`;
+    try {
+      const errJson = (await response.json()) as { error?: string };
+      if (errJson?.error) detail = errJson.error;
+    } catch {
+      // Keep status fallback
+    }
+    throw new Error(detail);
   }
 
   const payload = await response.json();
-  const latestItem = payload?.data?.items?.[0] ?? payload?.items?.[0];
+  const rawItems: Array<{
+    timestamp?: string;
+    updatedTimestamp?: string;
+    update_timestamp?: string;
+    readings?: Record<string, Record<string, number>>;
+  }> = payload?.data?.items ?? payload?.items ?? [];
+
+  const latestItem = rawItems[0];
   const readings = latestItem?.readings;
 
   if (!readings || !readings.psi_twenty_four_hourly) {
     throw new Error('Response does not match NEA v2 PSI readings schema');
   }
 
-  let pm25OneHourlyMap: Partial<Record<MonitoringRegionId, number>> = {};
-  if (pm25EndpointUrl) {
+  let pm25OneHourlyMap: Partial<Record<MonitoringRegionId, number>> =
+    (readings.pm25_one_hourly as Partial<Record<MonitoringRegionId, number>> | undefined) ?? {};
+
+  if (
+    Object.keys(pm25OneHourlyMap).length === 0 &&
+    pm25EndpointUrl &&
+    isAllowedEndpointUrl(pm25EndpointUrl)
+  ) {
     try {
       const pmRes = await fetch(pm25EndpointUrl, { headers: { Accept: 'application/json' } });
       if (pmRes.ok) {
@@ -514,15 +579,22 @@ export async function fetchFromNeaCompatibleEndpoint(
     }
   }
 
-  const updatedDate = latestItem.update_timestamp
-    ? new Date(latestItem.update_timestamp)
-    : new Date();
+  const rawUpdated = latestItem.updatedTimestamp ?? latestItem.update_timestamp;
+  const updatedDate = rawUpdated
+    ? new Date(rawUpdated)
+    : latestItem.timestamp
+      ? new Date(latestItem.timestamp)
+      : new Date();
 
+  const previousItem = rawItems.length > 1 ? rawItems[1] : undefined;
   const regions = {} as Record<RegionId, RegionStation>;
   let nationalPm25Sum = 0;
 
   ALL_REGION_IDS.forEach((regionId) => {
     const psi24 = Number(readings.psi_twenty_four_hourly?.[regionId] ?? 0);
+    const prevPsi24 = previousItem?.readings?.psi_twenty_four_hourly?.[regionId];
+    const delta1h = prevPsi24 !== undefined ? psi24 - Number(prevPsi24) : 0;
+
     const pm25_24 = Number(readings.pm25_twenty_four_hourly?.[regionId] ?? 0);
     const pm25_1h =
       regionId !== 'national' && pm25OneHourlyMap[regionId] !== undefined
@@ -540,7 +612,7 @@ export async function fetchFromNeaCompatibleEndpoint(
       shortLabel: meta.shortLabel,
       landmarks: meta.landmarks,
       coordinates: { lat: meta.lat, lng: meta.lng },
-      delta1h: 0,
+      delta1h,
       dominantPollutant: psi24 > 50 ? 'PM2.5 (24-hr)' : 'PM2.5 / O3',
       readings: {
         psi24h: psi24,
@@ -566,27 +638,63 @@ export async function fetchFromNeaCompatibleEndpoint(
     );
   }
 
-  // Synthesize single-point or fallback 24h curve anchored to live reading
-  const baseline = generateSnapshot('baseline', updatedDate, 0);
-  const hourlyTrend = baseline.hourlyTrend.map((pt, idx) => {
-    if (idx === baseline.hourlyTrend.length - 1) {
-      const psiMap = {} as Record<RegionId, number>;
-      const pmMap = {} as Record<RegionId, number>;
-      ALL_REGION_IDS.forEach((id) => {
-        psiMap[id] = regions[id].readings.psi24h;
-        pmMap[id] = regions[id].readings.pm25Hourly;
+  // Build hourly trend: if NEA returned multiple historical items, plot them chronologically;
+  // otherwise anchor a 24h series ending at the latest live reading.
+  let hourlyTrend: HourlyDataPoint[];
+  if (rawItems.length >= 6) {
+    hourlyTrend = [...rawItems]
+      .slice(0, 24)
+      .reverse()
+      .map((item, idx, arr) => {
+        const ptDate = item.timestamp ? new Date(item.timestamp) : updatedDate;
+        const psiMap = {} as Record<RegionId, number>;
+        const pmMap = {} as Record<RegionId, number>;
+        let pmSum = 0;
+
+        ALL_REGION_IDS.forEach((id) => {
+          psiMap[id] = Number(item.readings?.psi_twenty_four_hourly?.[id] ?? 0);
+          const pmVal =
+            id !== 'national' && idx === arr.length - 1 && pm25OneHourlyMap[id] !== undefined
+              ? Number(pm25OneHourlyMap[id])
+              : Number(item.readings?.pm25_twenty_four_hourly?.[id] ?? 0);
+          pmMap[id] = pmVal;
+          if (id !== 'national') pmSum += pmVal;
+        });
+        pmMap.national = Math.round(pmSum / MONITORING_REGION_IDS.length);
+
+        return {
+          hourLabel: idx === arr.length - 1 ? 'Now' : formatSgtHour(ptDate),
+          timestampIso: ptDate.toISOString(),
+          psi24h: psiMap,
+          pm25Hourly: pmMap,
+        };
       });
-      return {
-        ...pt,
-        psi24h: psiMap,
-        pm25Hourly: pmMap,
-      };
-    }
-    return pt;
-  });
+  } else {
+    const baseline = generateSnapshot('baseline', updatedDate, 0);
+    hourlyTrend = baseline.hourlyTrend.map((pt, idx) => {
+      if (idx === baseline.hourlyTrend.length - 1) {
+        const psiMap = {} as Record<RegionId, number>;
+        const pmMap = {} as Record<RegionId, number>;
+        ALL_REGION_IDS.forEach((id) => {
+          psiMap[id] = regions[id].readings.psi24h;
+          pmMap[id] = regions[id].readings.pm25Hourly;
+        });
+        return {
+          ...pt,
+          psi24h: psiMap,
+          pm25Hourly: pmMap,
+        };
+      }
+      return pt;
+    });
+  }
+
+  const viaServerless = psiEndpointUrl.startsWith('/api/');
 
   return {
-    sourceLabel: 'Live NEA API Connection',
+    sourceLabel: viaServerless
+      ? 'Live · data.gov.sg (/api/psi)'
+      : 'Live · Direct NEA Endpoint',
     isLiveApi: true,
     scenario: 'baseline',
     updatedAtIso: updatedDate.toISOString(),
@@ -595,9 +703,9 @@ export async function fetchFromNeaCompatibleEndpoint(
       directionLabel: 'SW',
       bearingDeg: 220,
       speedKmh: 12,
-      visibilityKm: regions.national.readings.psi24h > 100 ? 4.2 : 12.0,
+      visibilityKm: regions.national.readings.psi24h > 100 ? 4.2 : 12.5,
       humidityPct: 76,
-      temperatureC: 30.8,
+      temperatureC: 30.6,
     },
     regions,
     hourlyTrend,
